@@ -1,3 +1,5 @@
+# This forked repository solves OOM issues on 5090
+
 # FaceLift: Learning Generalizable Single Image 3D Face Reconstruction from Synthetic Heads
 
 ### 🌺 ICCV 2025 🌺

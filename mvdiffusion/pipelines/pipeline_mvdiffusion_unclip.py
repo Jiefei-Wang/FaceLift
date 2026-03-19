@@ -257,9 +257,8 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline):
         # _____________________________vae input latents__________________________________________________
         image_pt = torch.stack([TF.to_tensor(img) for img in image_pil], dim=0).to(device)
         image_pt = image_pt * 2.0 - 1.0
-        ###### Fix [RuntimeError: Input type (float) and bias type (c10::Half) should be the same] ######
-        image_pt = image_pt.to(torch.float16)
-        ###### Fix [RuntimeError: Input type (float) and bias type (c10::Half) should be the same] ######
+        vae_dtype = next(self.vae.parameters()).dtype
+        image_pt = image_pt.to(dtype=vae_dtype)
         image_latents = self.vae.encode(image_pt).latent_dist.mode() * self.vae.config.scaling_factor
         # Note: repeat differently from official pipelines     
         image_latents = image_latents.repeat(num_images_per_prompt, 1, 1, 1)

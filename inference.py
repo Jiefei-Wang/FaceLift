@@ -24,7 +24,7 @@ import yaml
 import json
 import importlib
 import warnings
-from typing import List, Tuple, Optional
+from typing import Tuple, Optional
 
 import torch
 import numpy as np
@@ -36,6 +36,14 @@ from rembg import remove
 from facenet_pytorch import MTCNN
 from huggingface_hub import snapshot_download
 
+from diffusers.utils.import_utils import is_xformers_available
+from diffusers.models.attention_processor import XFormersAttnProcessor, AttnProcessor2_0
+from mvdiffusion.models.transformer_mv2d_image import (
+    MVAttnProcessor,
+    XFormersMVAttnProcessor,
+    JointAttnProcessor,
+    XFormersJointAttnProcessor,
+)
 from mvdiffusion.pipelines.pipeline_mvdiffusion_unclip import StableUnCLIPImg2ImgPipeline
 from gslrm.model.gaussians_renderer import render_turntable, imageseq2video
 from utils_folder.face_utils import preprocess_image, preprocess_image_without_cropping
@@ -102,23 +110,67 @@ def initialize_face_detector(device: torch.device) -> MTCNN:
     )
 
 
+def _select_pipeline_dtype(device: torch.device) -> torch.dtype:
+    if device.type != "cuda":
+        return torch.float32
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _select_gslrm_dtype(device: torch.device) -> torch.dtype:
+    if device.type != "cuda":
+        return torch.float32
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _enable_xformers_attention(pipeline) -> None:
+    if not is_xformers_available():
+        print("xformers not available; using default attention")
+        return
+    try:
+        pipeline.unet.enable_xformers_memory_efficient_attention()
+    except Exception as exc:
+        print(f"xformers attention disabled: {exc}")
+
+
+def _force_xformers_attn_processors(pipeline) -> None:
+    if not is_xformers_available():
+        return
+    processors = {}
+    for name, proc in pipeline.unet.attn_processors.items():
+        if isinstance(proc, MVAttnProcessor):
+            processors[name] = XFormersMVAttnProcessor()
+        elif isinstance(proc, JointAttnProcessor):
+            processors[name] = XFormersJointAttnProcessor()
+        elif isinstance(proc, AttnProcessor2_0):
+            processors[name] = XFormersAttnProcessor()
+        else:
+            processors[name] = proc
+    pipeline.unet.set_attn_processor(processors)
+
+
 def initialize_mvdiffusion_pipeline(mvdiffusion_checkpoint_path: str, device: torch.device):
     """Initialize MV Diffusion pipeline."""
     script_directory = download_weights_from_hf()
     
+    torch_dtype = _select_pipeline_dtype(device)
     diffusion_pipeline = StableUnCLIPImg2ImgPipeline.from_pretrained(
         mvdiffusion_checkpoint_path,
-        torch_dtype=torch.float16,
+        torch_dtype=torch_dtype,
     )
-    diffusion_pipeline.unet.enable_xformers_memory_efficient_attention()
-    diffusion_pipeline.to(device)
-    random_generator = torch.Generator(device=diffusion_pipeline.unet.device)
+    diffusion_pipeline.enable_vae_slicing()
+    _enable_xformers_attention(diffusion_pipeline)
+    _force_xformers_attn_processors(diffusion_pipeline)
     
     color_prompt_embeddings = torch.load(
-        os.path.join(script_directory, "mvdiffusion/data/fixed_prompt_embeds_6view/clr_embeds.pt")
+        os.path.join(script_directory, "mvdiffusion/data/fixed_prompt_embeds_6view/clr_embeds.pt"),
+        map_location="cpu",
     )
     
-    return diffusion_pipeline, random_generator, color_prompt_embeddings
+    return diffusion_pipeline, color_prompt_embeddings
 
 
 def initialize_gslrm_model(gslrm_checkpoint_path: str, gslrm_config_path: str, device: torch.device):
@@ -131,8 +183,6 @@ def initialize_gslrm_model(gslrm_checkpoint_path: str, gslrm_config_path: str, d
     gslrm_model = ModelClass(model_config)
     model_checkpoint = torch.load(gslrm_checkpoint_path, map_location="cpu")
     gslrm_model.load_state_dict(model_checkpoint["model"])
-    gslrm_model = gslrm_model.to(device)
-    
     return gslrm_model
 
 
@@ -156,8 +206,8 @@ def setup_camera_parameters(device: torch.device) -> Tuple[torch.Tensor, torch.T
     camera_intrinsics_array = np.stack(camera_intrinsics_list, axis=0).astype(np.float32)
     camera_extrinsics_array = np.stack(camera_extrinsics_list, axis=0).astype(np.float32)
 
-    camera_intrinsics_tensor = torch.from_numpy(camera_intrinsics_array).float()[None].to(device)
-    camera_extrinsics_tensor = torch.from_numpy(camera_extrinsics_array).float()[None].to(device)
+    camera_intrinsics_tensor = torch.from_numpy(camera_intrinsics_array).float()[None]
+    camera_extrinsics_tensor = torch.from_numpy(camera_extrinsics_array).float()[None]
     
     return camera_intrinsics_tensor, camera_extrinsics_tensor
 
@@ -168,7 +218,8 @@ def process_single_image(
     output_dir: str,
     auto_crop: bool,
     unclip_pipeline,
-    generator: torch.Generator,
+    device: torch.device,
+    seed: int,
     color_prompt_embedding: torch.Tensor,
     gs_lrm_model,
     demo_fxfycxcy: torch.Tensor,
@@ -186,7 +237,6 @@ def process_single_image(
 
     demo_output_local_dir = os.path.join(output_dir, image_name)
     os.makedirs(demo_output_local_dir, exist_ok=True)
-
     # Preprocess image
     try:
         if auto_crop:
@@ -205,16 +255,35 @@ def process_single_image(
     input_image.save(os.path.join(demo_output_local_dir, "input.png"))
 
     # Generate multi-view images
-    mv_imgs = unclip_pipeline(
-        input_image, 
-        None,
-        prompt_embeds=color_prompt_embedding,
-        guidance_scale=guidance_scale_2D,
-        num_images_per_prompt=1, 
-        num_inference_steps=step_2D,
-        generator=generator,
-        eta=1.0,
-    ).images
+    unclip_pipeline.to(device)
+    execution_device = getattr(unclip_pipeline, "_execution_device", device)
+    if hasattr(unclip_pipeline, "image_normalizer"):
+        normalizer = unclip_pipeline.image_normalizer
+        if hasattr(normalizer, "mean"):
+            if isinstance(normalizer.mean, torch.nn.Parameter):
+                normalizer.mean.data = normalizer.mean.data.to(execution_device)
+            else:
+                normalizer.mean = normalizer.mean.to(execution_device)
+        if hasattr(normalizer, "std"):
+            if isinstance(normalizer.std, torch.nn.Parameter):
+                normalizer.std.data = normalizer.std.data.to(execution_device)
+            else:
+                normalizer.std = normalizer.std.to(execution_device)
+    prompt_embeds = color_prompt_embedding.to(device=execution_device, dtype=unclip_pipeline.unet.dtype)
+    generator = torch.Generator(device=execution_device)
+    generator.manual_seed(seed)
+    with torch.inference_mode():
+        mv_imgs = unclip_pipeline(
+            input_image, 
+            None,
+            prompt_embeds=prompt_embeds,
+            guidance_scale=guidance_scale_2D,
+            num_images_per_prompt=1, 
+            num_inference_steps=step_2D,
+            generator=generator,
+            eta=1.0,
+        ).images
+    del prompt_embeds
 
     # Always use 6 views
     if len(mv_imgs) == 7:
@@ -232,25 +301,32 @@ def process_single_image(
 
     # Prepare input for 3D reconstruction
     lrm_input = np.stack([np.array(view) for view in views], axis=0)
-    lrm_input = torch.from_numpy(lrm_input).float()[None].to(demo_fxfycxcy.device) / 255
+    lrm_input = torch.from_numpy(lrm_input).float()[None].to(device) / 255
     lrm_input = rearrange(lrm_input, "b v h w c -> b v c h w")
 
     index = torch.stack([
         torch.zeros(lrm_input.size(1)).long(),
         torch.arange(lrm_input.size(1)).long(),
     ], dim=-1)
-    demo_index = index[None].to(demo_fxfycxcy.device)
+    demo_index = index[None].to(device)
+
+    gs_dtype = _select_gslrm_dtype(device)
+    fxfycxcy = demo_fxfycxcy.to(device, dtype=gs_dtype)
+    c2w = demo_c2w.to(device, dtype=gs_dtype)
+
+    gs_lrm_model.to(device, dtype=gs_dtype)
+    lrm_input = lrm_input.to(dtype=gs_dtype)
 
     # Create batch
     batch = edict({
         "image": lrm_input,
-        "c2w": demo_c2w,
-        "fxfycxcy": demo_fxfycxcy,
+        "c2w": c2w,
+        "fxfycxcy": fxfycxcy,
         "index": demo_index,
     })
 
     # 3D reconstruction inference
-    with torch.autocast(enabled=True, device_type="cuda", dtype=torch.float16):
+    with torch.inference_mode(), torch.autocast(enabled=True, device_type="cuda", dtype=gs_dtype):
         result = gs_lrm_model.forward(batch, create_visual=False, split_data=True)
 
     # Save Gaussian splatting result
@@ -286,13 +362,18 @@ def process_single_image(
         fps=DEFAULT_TURNTABLE_FPS
     )
 
+    del fxfycxcy, c2w, lrm_input, demo_index, batch, result, vis_image
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 def process_images(
     input_dir: str,
     output_dir: str,
     auto_crop: bool,
     unclip_pipeline,
-    generator: torch.Generator,
+    device: torch.device,
+    seed: int,
     color_prompt_embedding: torch.Tensor,
     gs_lrm_model,
     demo_fxfycxcy: torch.Tensor,
@@ -304,7 +385,7 @@ def process_images(
     """Process all images in the input directory."""
     if not os.path.isdir(input_dir):
         raise ValueError(f"Input directory does not exist: {input_dir}")
-        
+
     image_files = sorted(os.listdir(input_dir))
     valid_extensions = ('.png', '.jpg', '.jpeg')
     
@@ -314,7 +395,7 @@ def process_images(
             
         process_single_image(
             image_file, input_dir, output_dir, auto_crop,
-            unclip_pipeline, generator, color_prompt_embedding,
+            unclip_pipeline, device, seed, color_prompt_embedding,
             gs_lrm_model, demo_fxfycxcy, demo_c2w,
             guidance_scale_2D, step_2D, face_detector
         )
@@ -345,7 +426,7 @@ def main(
         input_dir = os.path.join(script_directory, "examples")
     if output_dir is None:
         output_dir = os.path.join(script_directory, "outputs")
-    
+
     # Setup device and paths
     computation_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     mvdiffusion_checkpoint_path, gslrm_checkpoint_path, gslrm_config_path = get_model_paths()
@@ -357,7 +438,7 @@ def main(
         face_detector = initialize_face_detector(computation_device)
 
     # Initialize models
-    diffusion_pipeline, random_generator, color_prompt_embeddings = initialize_mvdiffusion_pipeline(
+    diffusion_pipeline, color_prompt_embeddings = initialize_mvdiffusion_pipeline(
         mvdiffusion_checkpoint_path, computation_device
     )
     gslrm_model = initialize_gslrm_model(gslrm_checkpoint_path, gslrm_config_path, computation_device)
@@ -365,16 +446,14 @@ def main(
     # Setup camera parameters (always 6 views)
     camera_intrinsics_tensor, camera_extrinsics_tensor = setup_camera_parameters(computation_device)
     
-    # Set random seed
-    random_generator.manual_seed(seed)
-
     # Process images
     process_images(
         input_dir, 
         output_dir, 
         auto_crop,
         diffusion_pipeline,
-        random_generator,
+        computation_device,
+        seed,
         color_prompt_embeddings,
         gslrm_model,
         camera_intrinsics_tensor,

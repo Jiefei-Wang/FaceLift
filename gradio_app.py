@@ -30,12 +30,63 @@ from einops import rearrange
 from PIL import Image
 from huggingface_hub import snapshot_download
 
+from diffusers.utils.import_utils import is_xformers_available
+from diffusers.models.attention_processor import XFormersAttnProcessor, AttnProcessor2_0
+from mvdiffusion.models.transformer_mv2d_image import (
+    MVAttnProcessor,
+    XFormersMVAttnProcessor,
+    JointAttnProcessor,
+    XFormersJointAttnProcessor,
+)
 from gslrm.model.gaussians_renderer import render_turntable, imageseq2video
 from mvdiffusion.pipelines.pipeline_mvdiffusion_unclip import StableUnCLIPImg2ImgPipeline
 from utils_folder.face_utils import preprocess_image, preprocess_image_without_cropping
 
 # HuggingFace repository configuration
 HF_REPO_ID = "wlyu/OpenFaceLift"
+
+
+def _select_pipeline_dtype(device: torch.device) -> torch.dtype:
+    if device.type != "cuda":
+        return torch.float32
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _enable_xformers_attention(pipeline) -> None:
+    if not is_xformers_available():
+        print("xformers not available; using default attention")
+        return
+    try:
+        pipeline.unet.enable_xformers_memory_efficient_attention()
+    except Exception as exc:
+        print(f"xformers attention disabled: {exc}")
+
+
+def _force_xformers_attn_processors(pipeline) -> None:
+    if not is_xformers_available():
+        return
+    processors = {}
+    for name, proc in pipeline.unet.attn_processors.items():
+        if isinstance(proc, MVAttnProcessor):
+            processors[name] = XFormersMVAttnProcessor()
+        elif isinstance(proc, JointAttnProcessor):
+            processors[name] = XFormersJointAttnProcessor()
+        elif isinstance(proc, AttnProcessor2_0):
+            processors[name] = XFormersAttnProcessor()
+        else:
+            processors[name] = proc
+    pipeline.unet.set_attn_processor(processors)
+
+
+def _select_gslrm_dtype(device: torch.device) -> torch.dtype:
+    if device.type != "cuda":
+        return torch.float32
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
 
 def download_weights_from_hf() -> Path:
     """Download model weights from HuggingFace if not already present.
@@ -86,11 +137,14 @@ class FaceLiftPipeline:
         
         # Load models
         print("Loading models...")
+        torch_dtype = _select_pipeline_dtype(self.device)
         self.mvdiffusion_pipeline = StableUnCLIPImg2ImgPipeline.from_pretrained(
             str(workspace_dir / "checkpoints/mvdiffusion/pipeckpts"),
-            torch_dtype=torch.float16,
+            torch_dtype=torch_dtype,
         )
-        self.mvdiffusion_pipeline.unet.enable_xformers_memory_efficient_attention()
+        self.mvdiffusion_pipeline.enable_vae_slicing()
+        _enable_xformers_attention(self.mvdiffusion_pipeline)
+        _force_xformers_attn_processors(self.mvdiffusion_pipeline)
         self.mvdiffusion_pipeline.to(self.device)
         
         with open(workspace_dir / "configs/gslrm.yaml", "r") as f:
@@ -106,12 +160,13 @@ class FaceLiftPipeline:
             map_location="cpu"
         )
         self.gs_lrm_model.load_state_dict(checkpoint["model"])
-        self.gs_lrm_model.to(self.device)
+        self.gs_lrm_dtype = _select_gslrm_dtype(self.device)
+        self.gs_lrm_model.to(self.device, dtype=self.gs_lrm_dtype)
         
         self.color_prompt_embedding = torch.load(
             workspace_dir / "mvdiffusion/data/fixed_prompt_embeds_6view/clr_embeds.pt",
-            map_location=self.device
-        )
+            map_location="cpu",
+        ).to(device=self.device, dtype=self.mvdiffusion_pipeline.unet.dtype)
         
         with open(workspace_dir / "utils_folder/opencv_cameras.json", 'r') as f:
             self.cameras_data = json.load(f)["frames"]
@@ -165,7 +220,7 @@ class FaceLiftPipeline:
             # Prepare 3D reconstruction input
             view_arrays = [np.array(view) for view in selected_views]
             lrm_input = torch.from_numpy(np.stack(view_arrays, axis=0)).float()
-            lrm_input = lrm_input[None].to(self.device) / 255.0
+            lrm_input = lrm_input[None].to(self.device, dtype=self.gs_lrm_dtype) / 255.0
             lrm_input = rearrange(lrm_input, "b v h w c -> b v c h w")
             
             # Prepare camera parameters
@@ -175,8 +230,8 @@ class FaceLiftPipeline:
             
             fxfycxcy = torch.from_numpy(np.stack(fxfycxcy_list, axis=0).astype(np.float32))
             c2w = torch.from_numpy(np.stack(c2w_list, axis=0).astype(np.float32))
-            fxfycxcy = fxfycxcy[None].to(self.device)
-            c2w = c2w[None].to(self.device)
+            fxfycxcy = fxfycxcy[None].to(self.device, dtype=self.gs_lrm_dtype)
+            c2w = c2w[None].to(self.device, dtype=self.gs_lrm_dtype)
             
             batch_indices = torch.stack([
                 torch.zeros(lrm_input.size(1)).long(),
@@ -191,7 +246,7 @@ class FaceLiftPipeline:
             })
             
             # Run 3D reconstruction
-            with torch.autocast(enabled=True, device_type="cuda", dtype=torch.float16):
+            with torch.autocast(enabled=True, device_type="cuda", dtype=self.gs_lrm_dtype):
                 result = self.gs_lrm_model.forward(batch, create_visual=False, split_data=True)
             
             comp_image = result.render[0].unsqueeze(0).detach()
